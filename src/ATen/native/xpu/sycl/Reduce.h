@@ -52,6 +52,27 @@ struct get_native_sycl_op<T, std::void_t<typename T::native_sycl_op>> {
 template <class T>
 using native_sycl_op_t = typename get_native_sycl_op<T>::type;
 
+template <class arg_t, class CombineFunc, class NativeOp, int out_vec_sz>
+at::detail::Array<arg_t, out_vec_sz> tree_reduce(sycl::sub_group sg, at::detail::Array<arg_t, out_vec_sz> value, CombineFunc combine) {
+  if constexpr (!std::is_same<NativeOp, void>::value && std::is_floating_point_v<arg_t>) {
+#pragma unroll(out_vec_sz)
+    for (int i = 0; i < out_vec_sz; ++i) {
+      value[i] = sycl::reduce_over_group(sg, value[i], NativeOp{});
+    }
+  } else {
+    int sg_size = sg.get_local_range()[0];
+    for (int offset = 1; offset < sg_size; offset <<= 1) {
+#pragma unroll(out_vec_sz)
+      for (int i = 0; i < out_vec_sz; ++i) {
+        arg_t other = sycl::shift_group_left(sg, value[i], offset);
+        value[i] = combine(value[i], other);
+      }
+    }
+  }
+
+  return value;
+}
+
 template <class arg_t, class item_t, class CombineFunc, class NativeOp = void, int out_vec_sz = 1>
 inline at::detail::Array<arg_t, out_vec_sz> group_reduce(
     item_t item,
@@ -73,20 +94,7 @@ inline at::detail::Array<arg_t, out_vec_sz> group_reduce(
       wg_size % sg_size == 0 && "unsupported workgroup size for group reduce");
 
   // tree reduce in subgroup
-  if constexpr (!std::is_same<NativeOp, void>::value && std::is_floating_point_v<arg_t>) {
-#pragma unroll(out_vec_sz)
-    for (int i = 0; i < out_vec_sz; ++i) {
-      value[i] = sycl::reduce_over_group(sg, value[i], NativeOp{});
-    }
-  } else {
-    for (int offset = 1; offset < sg_size; offset <<= 1) {
-#pragma unroll(out_vec_sz)
-      for (int i = 0; i < out_vec_sz; ++i) {
-        arg_t other = sycl::shift_group_left(sg, value[i], offset);
-        value[i] = combine(value[i], other);
-      }
-    }
-  }
+  value = tree_reduce<arg_t, CombineFunc, NativeOp, out_vec_sz>(sg, value, combine);
 
   if (sg_lid == 0) {
     shared_[sg_gid] = value;
@@ -101,20 +109,7 @@ inline at::detail::Array<arg_t, out_vec_sz> group_reduce(
 
     if (sg_gid == 0 && sg_lid < sg_range) {
       value = shared_[sg_lid];
-      if constexpr (!std::is_same<NativeOp, void>::value && std::is_floating_point_v<arg_t>) {
-#pragma unroll(out_vec_sz)
-        for (int i = 0; i < out_vec_sz; ++i) {
-          value[i] = sycl::reduce_over_group(sg, value[i], NativeOp{});
-        }
-      } else {
-        for (int offset = 1; offset < sg_range; offset <<= 1) {
-#pragma unroll(out_vec_sz)
-          for (int i = 0; i < out_vec_sz; ++i) {
-            arg_t other = sycl::shift_group_left(sg, value[i], offset);
-            value[i] = combine(value[i], other);
-          }
-        }
-      }
+      value = tree_reduce<arg_t, CombineFunc, NativeOp, out_vec_sz>(sg, value, combine);
     }
   } else {
     // work item tree reduce
