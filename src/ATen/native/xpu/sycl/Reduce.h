@@ -30,6 +30,8 @@
 #include <type_traits>
 #include <utility>
 
+#include <sycl/ext/oneapi/experimental/user_defined_reductions.hpp>
+
 namespace at {
 namespace native {
 namespace xpu {
@@ -39,7 +41,18 @@ using at::detail::Array;
 
 namespace detail {
 
-template <class arg_t, class item_t, class CombineFunc, int out_vec_sz = 1>
+template <class T, class = void>
+struct get_native_sycl_op {
+  using type = void;
+};
+template <class T>
+struct get_native_sycl_op<T, std::void_t<typename T::native_sycl_op>> {
+  using type = typename T::native_sycl_op;
+};
+template <class T>
+using native_sycl_op_t = typename get_native_sycl_op<T>::type;
+
+template <class arg_t, class item_t, class CombineFunc, class NativeOp = void, int out_vec_sz = 1>
 inline at::detail::Array<arg_t, out_vec_sz> group_reduce(
     item_t item,
     int wg_size,
@@ -59,11 +72,19 @@ inline at::detail::Array<arg_t, out_vec_sz> group_reduce(
   SYCL_KERNEL_ASSERT(
       wg_size % sg_size == 0 && "unsupported workgroup size for group reduce");
 
-  for (int offset = 1; offset < sg_size; offset <<= 1) {
+  // tree reduce in subgroup
+  if constexpr (!std::is_same<NativeOp, void>::value && std::is_floating_point_v<arg_t>) {
 #pragma unroll(out_vec_sz)
     for (int i = 0; i < out_vec_sz; ++i) {
-      arg_t other = sycl::shift_group_left(sg, value[i], offset);
-      value[i] = combine(value[i], other);
+      value[i] = sycl::reduce_over_group(sg, value[i], NativeOp{});
+    }
+  } else {
+    for (int offset = 1; offset < sg_size; offset <<= 1) {
+#pragma unroll(out_vec_sz)
+      for (int i = 0; i < out_vec_sz; ++i) {
+        arg_t other = sycl::shift_group_left(sg, value[i], offset);
+        value[i] = combine(value[i], other);
+      }
     }
   }
 
@@ -80,11 +101,18 @@ inline at::detail::Array<arg_t, out_vec_sz> group_reduce(
 
     if (sg_gid == 0 && sg_lid < sg_range) {
       value = shared_[sg_lid];
-      for (int offset = 1; offset < sg_range; offset <<= 1) {
+      if constexpr (!std::is_same<NativeOp, void>::value && std::is_floating_point_v<arg_t>) {
 #pragma unroll(out_vec_sz)
         for (int i = 0; i < out_vec_sz; ++i) {
-          arg_t other = sycl::shift_group_left(sg, value[i], offset);
-          value[i] = combine(value[i], other);
+          value[i] = sycl::reduce_over_group(sg, value[i], NativeOp{});
+        }
+      } else {
+        for (int offset = 1; offset < sg_range; offset <<= 1) {
+#pragma unroll(out_vec_sz)
+          for (int i = 0; i < out_vec_sz; ++i) {
+            arg_t other = sycl::shift_group_left(sg, value[i], offset);
+            value[i] = combine(value[i], other);
+          }
         }
       }
     }
@@ -471,6 +499,8 @@ template <typename out_scalar_t, typename func_t>
 struct func_wrapper_t {
   using arg_t = typename binary_function_traits<func_t>::arg1_t;
   using scalar_t = typename binary_function_traits<func_t>::arg2_t;
+  // Propagate native_sycl_op from func_t
+  using native_sycl_op = native_sycl_op_t<func_t>;
 
   func_t combine;
   static inline out_scalar_t project(arg_t arg) {
@@ -596,11 +626,14 @@ struct ReduceOp {
       return ops.combine(value, other);
     };
 
+    using native_op_t = native_sycl_op_t<ops_t>;
+
     if (config.should_group_x_reduce() && config.should_group_y_reduce()) {
       value = group_reduce<
           arg_t,
           decltype(pos),
           decltype(combine),
+          native_op_t,
           output_vec_size>(pos, config.num_items, shared, value, combine);
     } else {
       if (config.should_group_y_reduce()) {
