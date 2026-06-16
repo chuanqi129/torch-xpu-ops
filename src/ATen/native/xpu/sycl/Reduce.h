@@ -50,7 +50,12 @@ struct get_native_sycl_op<T, std::void_t<typename T::native_sycl_op>> {
 template <class T>
 using native_sycl_op_t = typename get_native_sycl_op<T>::type;
 
-template <class arg_t, class CombineFunc, class NativeOp, int out_vec_sz>
+template <
+    class arg_t,
+    class CombineFunc,
+    class NativeOp,
+    int out_vec_sz,
+    int sg_sz>
 void subgroup_tree_reduce(
     sycl::sub_group sg,
     at::detail::Array<arg_t, out_vec_sz>& value,
@@ -65,8 +70,8 @@ void subgroup_tree_reduce(
       value[i] = sycl::reduce_over_group(sg, value[i], NativeOp{});
     }
   } else {
-    int sg_size = sg.get_local_range()[0];
-    for (int offset = 1; offset < sg_size; offset <<= 1) {
+#pragma unroll
+    for (int offset = 1; offset < sg_sz; offset <<= 1) {
 #pragma unroll(out_vec_sz)
       for (int i = 0; i < out_vec_sz; ++i) {
         arg_t other = sycl::shift_group_left(sg, value[i], offset);
@@ -101,9 +106,17 @@ inline at::detail::Array<arg_t, out_vec_sz> group_reduce(
   SYCL_KERNEL_ASSERT(
       wg_size % sg_size == 0 && "unsupported workgroup size for group reduce");
 
-  // tree reduce in subgroup
-  subgroup_tree_reduce<arg_t, CombineFunc, NativeOp, out_vec_sz>(
-      sg, value, combine);
+  // tree reduce in subgroup; dispatch on runtime sg_size so the template
+  // parameter is exact and the inner loop can be fully unrolled.
+  // sg_size is guaranteed to be a power-of-2; the assert above ensures
+  // wg_size % sg_size == 0, so no partial-subgroup ambiguity exists here.
+  if (sg_size == 32) {
+    subgroup_tree_reduce<arg_t, CombineFunc, NativeOp, out_vec_sz, 32>(
+        sg, value, combine);
+  } else {
+    subgroup_tree_reduce<arg_t, CombineFunc, NativeOp, out_vec_sz, 16>(
+        sg, value, combine);
+  }
 
   if (sg_lid == 0) {
     shared_[sg_gid] = value;
